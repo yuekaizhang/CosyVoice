@@ -16,7 +16,7 @@ import time
 from typing import Generator
 from tqdm import tqdm
 from hyperpyyaml import load_hyperpyyaml
-from modelscope import snapshot_download
+# from modelscope import snapshot_download
 import torch
 from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from cosyvoice.cli.model import CosyVoiceModel, CosyVoice2Model
@@ -131,7 +131,8 @@ class CosyVoice2(CosyVoice):
         self.model_dir = model_dir
         self.fp16 = fp16
         if not os.path.exists(model_dir):
-            model_dir = snapshot_download(model_dir)
+            raise NotImplementedError
+            # model_dir = snapshot_download(model_dir)
         with open('{}/cosyvoice.yaml'.format(model_dir), 'r') as f:
             configs = load_hyperpyyaml(f, overrides={'qwen_pretrain_path': os.path.join(model_dir, 'CosyVoice-BlankEN')})
         assert get_model_type(configs) == CosyVoice2Model, 'do not use {} for CosyVoice2 initialization!'.format(model_dir)
@@ -171,3 +172,23 @@ class CosyVoice2(CosyVoice):
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
                 start_time = time.time()
+
+
+    def inference_speech_token(self, tts_text, prompt_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):
+        tokens = []
+        prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+
+            tts_text_token, tts_text_token_len = self.frontend._extract_text_token(i)
+            prompt_text_token, prompt_text_token_len = self.frontend._extract_text_token(prompt_text)
+            speech_token, speech_token_len = self.frontend._extract_speech_token(prompt_speech_16k)
+
+            for i in self.model.llm.inference(text=tts_text_token.to(self.model.device),
+                                        text_len=torch.tensor([tts_text_token.shape[1]], dtype=torch.int32).to(self.model.device),
+                                        prompt_text=prompt_text_token.to(self.model.device),
+                                        prompt_text_len=torch.tensor([prompt_text_token.shape[1]], dtype=torch.int32).to(self.model.device),
+                                        prompt_speech_token=speech_token.to(self.model.device),
+                                        prompt_speech_token_len=torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(self.model.device),
+                                        embedding=None):
+                tokens.append(i)
+        return tokens, speech_token
