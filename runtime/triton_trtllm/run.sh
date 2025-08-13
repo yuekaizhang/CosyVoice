@@ -1,6 +1,7 @@
 
 export CUDA_VISIBLE_DEVICES=0
 cosyvoice_path=/workspace/CosyVoice
+cosyvoice_path=/workspace_yuekai/tts/CosyVoice
 export PYTHONPATH=${cosyvoice_path}:$PYTHONPATH
 export PYTHONPATH=${cosyvoice_path}/third_party/Matcha-TTS:$PYTHONPATH
 stage=$1
@@ -102,4 +103,28 @@ if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
         --mode $mode \
         --huggingface-dataset yuekai/seed_tts_cosy2 \
         --log-dir ./log_concurrent_tasks_${num_task}_${mode}_bls_4_${trt_dtype}
+fi
+
+if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
+  echo "stage 6: Test the model"
+  n_gpus=1
+  datasets=(zero_shot_zh test_zh)
+  datasets=(wenetspeech4tts)
+  backend=hf
+  # backend=trtllm
+  #huggingface_model_local_dir=./llasa_cosyvoice2_token_qwen_0.5b/checkpoint-885000
+  batch_size=8
+  for dataset in ${datasets[@]}; do
+  output_dir=./outputs_${backend}_batch_size_${batch_size}_${dataset}
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  torchrun --nproc_per_node=$n_gpus \
+      infer_dataset.py \
+        --output-dir $output_dir \
+        --llm-model-name-or-path $huggingface_model_local_dir \
+        --token2wav-path $model_scope_model_local_dir \
+        --backend $backend \
+        --batch-size $batch_size \
+        --engine-dir $trt_engines_dir \
+        --split-name ${dataset} || exit 1
+  done
 fi
