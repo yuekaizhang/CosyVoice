@@ -10,6 +10,7 @@ from datasets import load_dataset
 import torchaudio
 import os
 import logging
+import argparse
 import queue
 import time
 
@@ -69,7 +70,7 @@ class TrtContextWrapper:
         self.trt_context_pool.put([context, stream])
 
 class CosyVoice2_Token2Wav(torch.nn.Module):
-    def __init__(self, model_dir: str = "./CosyVoice2-0.5B"):
+    def __init__(self, model_dir: str = "./CosyVoice2-0.5B", enable_trt: bool = False):
         super().__init__()
         self.flow = CausalMaskedDiffWithXvec()
         self.flow.half()
@@ -82,17 +83,17 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
         self.hift.cuda().eval()
 
         option = onnxruntime.SessionOptions()
-        option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
         self.spk_model = onnxruntime.InferenceSession(f"{model_dir}/campplus.onnx", sess_options=option,
                                                     providers=["CPUExecutionProvider"])
         
         self.audio_tokenizer = s3tokenizer.load_model("speech_tokenizer_v2_25hz").cuda().eval()
-
-        # self.load_trt(f'{model_dir}/flow.decoder.estimator.fp16.dynamic_batch.plan',
-        #                     f'{model_dir}/flow.decoder.estimator.fp32.dynamic_batch.onnx',
-        #                     1,
-        #                     True)
+        if enable_trt:
+            self.load_trt(f'{model_dir}/flow.decoder.estimator.fp16.dynamic_batch.plan',
+                                f'{model_dir}/flow.decoder.estimator.fp32.dynamic_batch.onnx',
+                                1,
+                                True)
 
     def load_trt(self, flow_decoder_estimator_model, flow_decoder_onnx_model, trt_concurrent=1, fp16=True):
         assert torch.cuda.is_available(), 'tensorrt only supports gpu!'
@@ -201,11 +202,43 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
     ):
         # assert all item in prompt_audios_sample_rate is 16000
         assert all(sample_rate == 16000 for sample_rate in prompt_audios_sample_rate)
+        
+        # Create CUDA events for precise timing
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        # Synchronize before starting
+        torch.cuda.synchronize()
+        start_event.record()
         prompt_speech_tokens_list = self.prompt_audio_tokenization(prompt_audios_list)
+        end_event.record()
+        torch.cuda.synchronize()
+        print(f"prompt_audio_tokenization taken: {start_event.elapsed_time(end_event):.4f} ms")
+        
+        start_event.record()
         prompt_mels_for_flow, prompt_mels_lens_for_flow = self.get_prompt_mels(prompt_audios_list, prompt_audios_sample_rate)
+        end_event.record()
+        torch.cuda.synchronize()
+        print(f"get_prompt_mels taken: {start_event.elapsed_time(end_event):.4f} ms")
+        
+        start_event.record()
         spk_emb_for_flow = self.get_spk_emb(prompt_audios_list)
+        end_event.record()
+        torch.cuda.synchronize()
+        print(f"get_spk_emb taken: {start_event.elapsed_time(end_event):.4f} ms")
+        
+        start_event.record()
         generated_mels, generated_mels_lens = self.forward_flow(prompt_speech_tokens_list, generated_speech_tokens_list, prompt_mels_for_flow, prompt_mels_lens_for_flow, spk_emb_for_flow)
+        end_event.record()
+        torch.cuda.synchronize()
+        print(f"forward_flow taken: {start_event.elapsed_time(end_event):.4f} ms")
+        
+        start_event.record()
         generated_wavs = self.forward_hift(generated_mels, generated_mels_lens, prompt_mels_lens_for_flow)
+        end_event.record()
+        torch.cuda.synchronize()
+        print(f"forward_hift taken: {start_event.elapsed_time(end_event):.4f} ms")
+        print("--------------------------------")
         return generated_wavs
 
 
@@ -220,20 +253,27 @@ def collate_fn(batch):
 
     return ids, generated_speech_tokens_list, prompt_audios_list, prompt_audios_sample_rate
 
-
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--enable-trt", action="store_true")
+    parser.add_argument("--model-dir", type=str, default="./CosyVoice2-0.5B")
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--output-dir", type=str, default="generated_wavs")
+    parser.add_argument("--huggingface-dataset-split", type=str, default="wenetspeech4tts")
+    return parser.parse_args()
 
 if __name__ == "__main__":
-    model = CosyVoice2_Token2Wav()
-    output_dir = "generated_wavs"
+    args = get_args()
+    model = CosyVoice2_Token2Wav(model_dir=args.model_dir, enable_trt=args.enable_trt)
     # mkdir output_dir if not exists
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
     dataset_name = "yuekai/seed_tts_cosy2"
-    huggingface_dataset_split = "wenetspeech4tts"
-    dataset = load_dataset(dataset_name, split=huggingface_dataset_split, trust_remote_code=True)
+
+    dataset = load_dataset(dataset_name, split=args.huggingface_dataset_split, trust_remote_code=True)
 
 
-    data_loader = DataLoader(dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
+    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
     for _ in range(3):
         start_time = time.time()
         for batch in data_loader:
@@ -242,6 +282,12 @@ if __name__ == "__main__":
             generated_wavs = model(generated_speech_tokens_list, prompt_audios_list, prompt_audios_sample_rate)
 
             for id, wav in zip(ids, generated_wavs):
-                torchaudio.save(f"{output_dir}/{id}.wav", wav.cpu(), 24000)
+                torchaudio.save(f"{args.output_dir}/{id}.wav", wav.cpu(), 24000)
         end_time = time.time()
         print(f"Time taken: {end_time - start_time} seconds")
+
+    with open(f"{args.output_dir}/log.txt", "w") as f:
+        f.write(f"Time taken: {end_time - start_time} seconds\n")
+        # write args to log.txt
+        for arg, value in vars(args).items():
+            f.write(f"{arg}: {value}\n")
