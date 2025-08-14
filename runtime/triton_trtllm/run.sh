@@ -128,3 +128,10 @@ if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
         --split-name ${dataset} || exit 1
   done
 fi
+
+
+if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
+
+    python3 export_onnx.py --model_dir $model_scope_model_local_dir --onnx_model flow.decoder.estimator.fp32.dynamic_batch.onnx
+
+fi
