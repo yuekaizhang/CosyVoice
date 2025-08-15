@@ -83,12 +83,12 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
         self.hift.cuda().eval()
 
         option = onnxruntime.SessionOptions()
-        # option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
         self.spk_model = onnxruntime.InferenceSession(f"{model_dir}/campplus.onnx", sess_options=option,
                                                     providers=["CPUExecutionProvider"])
         
-        self.audio_tokenizer = s3tokenizer.load_model("speech_tokenizer_v2_25hz").cuda().eval()
+        self.audio_tokenizer = s3tokenizer.load_model(f"{model_dir}/speech_tokenizer_v2.onnx").cuda().eval()
         if enable_trt:
             self.load_trt(f'{model_dir}/flow.decoder.estimator.fp16.dynamic_batch.plan',
                                 f'{model_dir}/flow.decoder.estimator.fp32.dynamic_batch.onnx',
@@ -238,7 +238,7 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
         end_event.record()
         torch.cuda.synchronize()
         print(f"forward_hift taken: {start_event.elapsed_time(end_event):.4f} ms")
-        print("--------------------------------")
+        print(f"--------------------------------")
         return generated_wavs
 
 
