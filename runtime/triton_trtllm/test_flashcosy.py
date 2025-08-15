@@ -89,11 +89,66 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
                                                     providers=["CPUExecutionProvider"])
         
         self.audio_tokenizer = s3tokenizer.load_model(f"{model_dir}/speech_tokenizer_v2.onnx").cuda().eval()
+        gpu="a100"
+        #gpu="h100"
+        #gpu="l20"
         if enable_trt:
-            self.load_trt(f'{model_dir}/flow.decoder.estimator.fp16.dynamic_batch.plan',
+            self.load_trt(f'{model_dir}/flow.decoder.estimator.fp16.dynamic_batch.{gpu}.plan',
                                 f'{model_dir}/flow.decoder.estimator.fp32.dynamic_batch.onnx',
                                 1,
                                 True)
+            self.load_spk_trt(f'{model_dir}/campplus.{gpu}.fp32.trt',
+                                f'{model_dir}/campplus.onnx',
+                                1,
+                                False)
+
+
+    def forward_spk_embedding(self, spk_feat):
+        if isinstance(self.spk_model, onnxruntime.InferenceSession):
+            return self.spk_model.run(
+                None, {self.spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()}
+            )[0].flatten().tolist()
+        else:
+            [spk_model, stream], trt_engine = self.spk_model.acquire_estimator()
+            # NOTE need to synchronize when switching stream
+            torch.cuda.current_stream().synchronize()
+            spk_feat = spk_feat.unsqueeze(dim=0).cuda()
+            batch_size = spk_feat.size(0)
+            # output shape (batch_size, 192)
+            with stream:
+                spk_model.set_input_shape('input', (batch_size, spk_feat.size(1), 80))
+                output_tensor = torch.empty((batch_size, 192), device=spk_feat.device)
+                # print(output_tensor.shape, output_tensor, "output_tensor")
+                data_ptrs = [spk_feat.contiguous().data_ptr(),
+                             output_tensor.contiguous().data_ptr()]
+                for i, j in enumerate(data_ptrs):
+                    # print(trt_engine.get_tensor_name(i))
+                    spk_model.set_tensor_address(trt_engine.get_tensor_name(i), j)
+                # run trt engine
+                assert spk_model.execute_async_v3(torch.cuda.current_stream().cuda_stream) is True
+                torch.cuda.current_stream().synchronize()
+            self.spk_model.release_estimator(spk_model, stream)
+            # print(output_tensor.shape, output_tensor)
+            # input()
+            # input()
+            return output_tensor.cpu().numpy().flatten().tolist()
+
+    def load_spk_trt(self, spk_model, spk_onnx_model, trt_concurrent=1, fp16=True):
+        if not os.path.exists(spk_model) or os.path.getsize(spk_model) == 0:
+            trt_kwargs = self.get_spk_trt_kwargs()
+            convert_onnx_to_trt(spk_model, trt_kwargs, spk_onnx_model, fp16)
+        import tensorrt as trt
+        with open(spk_model, 'rb') as f:
+            spk_engine = trt.Runtime(trt.Logger(trt.Logger.INFO)).deserialize_cuda_engine(f.read())
+        assert spk_engine is not None, 'failed to load trt {}'.format(spk_model)
+        self.spk_model = TrtContextWrapper(spk_engine, trt_concurrent=trt_concurrent)
+
+    def get_spk_trt_kwargs(self):
+        min_shape = [(1, 4, 80)]
+        opt_shape = [(1, 500, 80)]
+        max_shape = [(1, 3000, 80)]
+        input_names = ["input"]
+        return {'min_shape': min_shape, 'opt_shape': opt_shape, 'max_shape': max_shape, 'input_names': input_names}
 
     def load_trt(self, flow_decoder_estimator_model, flow_decoder_onnx_model, trt_concurrent=1, fp16=True):
         assert torch.cuda.is_available(), 'tensorrt only supports gpu!'
@@ -142,9 +197,11 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
             assert len(audio.shape) == 1
             spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
             spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
-            spk_emb = self.spk_model.run(
-                None, {self.spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()}
-            )[0].flatten().tolist()
+            # spk_emb = self.spk_model.run(
+            #     None, {self.spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()}
+            # )[0].flatten().tolist()
+            spk_emb = self.forward_spk_embedding(spk_feat)
+
             spk_emb_for_flow.append(spk_emb)
         spk_emb_for_flow = torch.tensor(spk_emb_for_flow)    
         return spk_emb_for_flow

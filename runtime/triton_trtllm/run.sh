@@ -2,6 +2,7 @@
 export CUDA_VISIBLE_DEVICES=0
 cosyvoice_path=/workspace/CosyVoice
 cosyvoice_path=/workspace_yuekai/tts/CosyVoice
+cosyvoice_path=/home/scratch.yuekaiz_wwfo_1/tts/cosyvoice/CosyVoice
 export PYTHONPATH=${cosyvoice_path}:$PYTHONPATH
 export PYTHONPATH=${cosyvoice_path}/third_party/Matcha-TTS:$PYTHONPATH
 stage=$1
@@ -131,7 +132,7 @@ fi
 
 
 if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
-
+    # pip install wetext inflect modelscope
     python3 export_onnx.py --model_dir $model_scope_model_local_dir --onnx_model flow.decoder.estimator.fp32.dynamic_batch.onnx
 
 fi
