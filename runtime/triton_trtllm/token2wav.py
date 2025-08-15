@@ -56,9 +56,10 @@ class TrtContextWrapper:
     def __init__(self, trt_engine, trt_concurrent=1, device='cuda:0'):
         self.trt_context_pool = queue.Queue(maxsize=trt_concurrent)
         self.trt_engine = trt_engine
+        self.device = device
         for _ in range(trt_concurrent):
             trt_context = trt_engine.create_execution_context()
-            trt_stream = torch.cuda.stream(torch.cuda.Stream(device))
+            trt_stream = torch.cuda.stream(torch.cuda.Stream(torch.device(device)))
             assert trt_context is not None, 'failed to create trt context, maybe not enough CUDA memory, try reduce current trt concurrent {}'.format(trt_concurrent)
             self.trt_context_pool.put([trt_context, trt_stream])
         assert self.trt_context_pool.empty() is False, 'no avaialbe estimator context'
@@ -70,17 +71,20 @@ class TrtContextWrapper:
         self.trt_context_pool.put([context, stream])
 
 class CosyVoice2_Token2Wav(torch.nn.Module):
-    def __init__(self, model_dir: str = "./CosyVoice2-0.5B", enable_trt: bool = False):
+    def __init__(self, model_dir: str = "./CosyVoice2-0.5B", enable_trt: bool = False, device_id: int = 0):
         super().__init__()
+        self.device_id = device_id
+        self.device = f"cuda:{device_id}"
+        
         self.flow = CausalMaskedDiffWithXvec()
         self.flow.half()
         self.flow.load_state_dict(torch.load(f"{model_dir}/flow.pt", map_location="cpu", weights_only=True), strict=True)
-        self.flow.cuda().eval()
+        self.flow.to(self.device).eval()
 
         self.hift = HiFTGenerator()
         hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load(f"{model_dir}/hift.pt", map_location="cpu", weights_only=True).items()}
         self.hift.load_state_dict(hift_state_dict, strict=True)
-        self.hift.cuda().eval()
+        self.hift.to(self.device).eval()
 
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -88,7 +92,7 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
         self.spk_model = onnxruntime.InferenceSession(f"{model_dir}/campplus.onnx", sess_options=option,
                                                     providers=["CPUExecutionProvider"])
         
-        self.audio_tokenizer = s3tokenizer.load_model(f"{model_dir}/speech_tokenizer_v2.onnx").cuda().eval()
+        self.audio_tokenizer = s3tokenizer.load_model(f"{model_dir}/speech_tokenizer_v2.onnx").to(self.device).eval()
 
         gpu="l20"
         if enable_trt:
@@ -110,23 +114,24 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
         else:
             [spk_model, stream], trt_engine = self.spk_model.acquire_estimator()
             # NOTE need to synchronize when switching stream
-            torch.cuda.current_stream().synchronize()
-            spk_feat = spk_feat.unsqueeze(dim=0).cuda()
-            batch_size = spk_feat.size(0)
-
-            with stream:
-                spk_model.set_input_shape('input', (batch_size, spk_feat.size(1), 80))
-                output_tensor = torch.empty((batch_size, 192), device=spk_feat.device)
-
-                data_ptrs = [spk_feat.contiguous().data_ptr(),
-                             output_tensor.contiguous().data_ptr()]
-                for i, j in enumerate(data_ptrs):
-
-                    spk_model.set_tensor_address(trt_engine.get_tensor_name(i), j)
-                # run trt engine
-                assert spk_model.execute_async_v3(torch.cuda.current_stream().cuda_stream) is True
+            with torch.cuda.device(self.device_id):
                 torch.cuda.current_stream().synchronize()
-            self.spk_model.release_estimator(spk_model, stream)
+                spk_feat = spk_feat.unsqueeze(dim=0).to(self.device)
+                batch_size = spk_feat.size(0)
+
+                with stream:
+                    spk_model.set_input_shape('input', (batch_size, spk_feat.size(1), 80))
+                    output_tensor = torch.empty((batch_size, 192), device=spk_feat.device)
+
+                    data_ptrs = [spk_feat.contiguous().data_ptr(),
+                                 output_tensor.contiguous().data_ptr()]
+                    for i, j in enumerate(data_ptrs):
+
+                        spk_model.set_tensor_address(trt_engine.get_tensor_name(i), j)
+                    # run trt engine
+                    assert spk_model.execute_async_v3(torch.cuda.current_stream().cuda_stream) is True
+                    torch.cuda.current_stream().synchronize()
+                self.spk_model.release_estimator(spk_model, stream)
 
             return output_tensor.cpu().numpy().flatten().tolist()
 
@@ -138,7 +143,7 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
         with open(spk_model, 'rb') as f:
             spk_engine = trt.Runtime(trt.Logger(trt.Logger.INFO)).deserialize_cuda_engine(f.read())
         assert spk_engine is not None, 'failed to load trt {}'.format(spk_model)
-        self.spk_model = TrtContextWrapper(spk_engine, trt_concurrent=trt_concurrent)
+        self.spk_model = TrtContextWrapper(spk_engine, trt_concurrent=trt_concurrent, device=self.device)
 
     def get_spk_trt_kwargs(self):
         min_shape = [(1, 4, 80)]
@@ -157,7 +162,7 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
         with open(flow_decoder_estimator_model, 'rb') as f:
             estimator_engine = trt.Runtime(trt.Logger(trt.Logger.INFO)).deserialize_cuda_engine(f.read())
         assert estimator_engine is not None, 'failed to load trt {}'.format(flow_decoder_estimator_model)
-        self.flow.decoder.estimator = TrtContextWrapper(estimator_engine, trt_concurrent=trt_concurrent)
+        self.flow.decoder.estimator = TrtContextWrapper(estimator_engine, trt_concurrent=trt_concurrent, device=self.device)
 
     def get_trt_kwargs_dynamic_batch(self, opt_batch_size=2, max_batch_size=64):
         min_shape = [(2, 80, 4), (2, 1, 4), (2, 80, 4), (2, 80, 4), (2,), (2, 80)]
@@ -174,7 +179,7 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
             prompt_speech_mels_list.append(log_mel)
         prompt_mels_for_llm, prompt_mels_lens_for_llm = s3tokenizer.padding(prompt_speech_mels_list)
         prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
-            prompt_mels_for_llm.cuda(), prompt_mels_lens_for_llm.cuda()
+            prompt_mels_for_llm.to(self.device), prompt_mels_lens_for_llm.to(self.device)
         )
         for i in range(len(prompt_speech_tokens)):
             speech_tokens_i = prompt_speech_tokens[i, :prompt_speech_tokens_lens[i].item()].tolist()
@@ -221,10 +226,10 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
         flow_inputs = torch.nn.utils.rnn.pad_sequence(flow_inputs, batch_first=True, padding_value=0)
         flow_inputs_lens = torch.tensor(flow_inputs_lens)
 
-        with torch.amp.autocast("cuda", dtype=torch.float16):
+        with torch.amp.autocast(self.device, dtype=torch.float16):
             generated_mels, generated_mels_lens = self.flow(
-                flow_inputs.cuda(), flow_inputs_lens.cuda(),
-                prompt_mels_for_flow.cuda(), prompt_mels_lens_for_flow.cuda(), spk_emb_for_flow.cuda(),
+                flow_inputs.to(self.device), flow_inputs_lens.to(self.device),
+                prompt_mels_for_flow.to(self.device), prompt_mels_lens_for_flow.to(self.device), spk_emb_for_flow.to(self.device),
                 streaming=False, finalize=True
             )
 
