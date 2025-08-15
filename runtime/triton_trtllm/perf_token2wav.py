@@ -247,18 +247,49 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
         # assert all item in prompt_audios_sample_rate is 16000
         assert all(sample_rate == 16000 for sample_rate in prompt_audios_sample_rate)
         
-
-        prompt_speech_tokens_list = self.prompt_audio_tokenization(prompt_audios_list)
-
-        prompt_mels_for_flow, prompt_mels_lens_for_flow = self.get_prompt_mels(prompt_audios_list, prompt_audios_sample_rate)
-
-        spk_emb_for_flow = self.get_spk_emb(prompt_audios_list)
-
-        generated_mels, generated_mels_lens = self.forward_flow(prompt_speech_tokens_list, generated_speech_tokens_list, prompt_mels_for_flow, prompt_mels_lens_for_flow, spk_emb_for_flow)
-
-        generated_wavs = self.forward_hift(generated_mels, generated_mels_lens, prompt_mels_lens_for_flow)
+        # Initialize timing dictionary
+        timing_info = {}
         
-        return generated_wavs
+        # Create CUDA events for precise timing
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        # Synchronize before starting
+        torch.cuda.synchronize()
+        start_event.record()
+        prompt_speech_tokens_list = self.prompt_audio_tokenization(prompt_audios_list)
+        end_event.record()
+        torch.cuda.synchronize()
+        timing_info['prompt_audio_tokenization'] = start_event.elapsed_time(end_event)
+        
+        start_event.record()
+        prompt_mels_for_flow, prompt_mels_lens_for_flow = self.get_prompt_mels(prompt_audios_list, prompt_audios_sample_rate)
+        end_event.record()
+        torch.cuda.synchronize()
+        timing_info['get_prompt_mels'] = start_event.elapsed_time(end_event)
+        
+        start_event.record()
+        spk_emb_for_flow = self.get_spk_emb(prompt_audios_list)
+        end_event.record()
+        torch.cuda.synchronize()
+        timing_info['get_spk_emb'] = start_event.elapsed_time(end_event)
+        
+        start_event.record()
+        generated_mels, generated_mels_lens = self.forward_flow(prompt_speech_tokens_list, generated_speech_tokens_list, prompt_mels_for_flow, prompt_mels_lens_for_flow, spk_emb_for_flow)
+        end_event.record()
+        torch.cuda.synchronize()
+        timing_info['forward_flow'] = start_event.elapsed_time(end_event)
+        
+        start_event.record()
+        generated_wavs = self.forward_hift(generated_mels, generated_mels_lens, prompt_mels_lens_for_flow)
+        end_event.record()
+        torch.cuda.synchronize()
+        timing_info['forward_hift'] = start_event.elapsed_time(end_event)
+        
+        # Calculate total time
+        timing_info['total_time'] = sum(timing_info.values())
+        
+        return generated_wavs, timing_info
 
 
 def collate_fn(batch):
@@ -295,20 +326,116 @@ if __name__ == "__main__":
 
     data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
     
+    # Initialize timing statistics collection for last epoch only
+    all_timing_data = []
+    epoch_times = []
+    
+    print(f"Running {args.warmup} epochs with warmup. Only the last epoch will be used for performance statistics.")
+    print("=" * 80)
     
     for epoch in range(args.warmup):
         start_time = time.time()
+        is_last_epoch = (epoch == args.warmup - 1)
+        
+        if is_last_epoch:
+            print(f"Epoch {epoch + 1}/{args.warmup} (MEASUREMENT EPOCH)")
+        else:
+            print(f"Epoch {epoch + 1}/{args.warmup} (WARMUP)")
         
         for batch in data_loader:
             ids, generated_speech_tokens_list, prompt_audios_list, prompt_audios_sample_rate = batch
 
-            generated_wavs = model(generated_speech_tokens_list, prompt_audios_list, prompt_audios_sample_rate)
+            generated_wavs, timing_info = model(generated_speech_tokens_list, prompt_audios_list, prompt_audios_sample_rate)
             
+            # Only collect timing data for the last epoch
+            if is_last_epoch:
+                all_timing_data.append(timing_info)
+                
+                # Print current batch timing info only for measurement epoch
+                print(f"Batch timing - ", end="")
+                for key, value in timing_info.items():
+                    print(f"{key}: {value:.4f}ms, ", end="")
+                print()
 
             for id, wav in zip(ids, generated_wavs):
                 torchaudio.save(f"{args.output_dir}/{id}.wav", wav.cpu(), 24000)
         
         end_time = time.time()
         epoch_time = end_time - start_time
-        print(f"Measurement epoch time taken: {epoch_time:.4f} seconds")
+        epoch_times.append(epoch_time)
+        
+        if is_last_epoch:
+            print(f"Measurement epoch time taken: {epoch_time:.4f} seconds")
+        else:
+            print(f"Warmup epoch time taken: {epoch_time:.4f} seconds")
+        print("=" * 50)
 
+    # Calculate timing statistics (only from measurement epoch)
+    timing_stats = {}
+    measurement_epoch_time = epoch_times[-1] if epoch_times else 0
+    
+    if all_timing_data:
+        timing_keys = all_timing_data[0].keys()
+        for key in timing_keys:
+            values = [data[key] for data in all_timing_data]
+            timing_stats[key] = {
+                'avg': sum(values) / len(values),
+                'min': min(values),
+                'max': max(values),
+                'total': sum(values),
+                'count': len(values)
+            }
+    
+    # Print comprehensive timing statistics
+    print("\n" + "=" * 70)
+    print("PERFORMANCE STATISTICS (MEASUREMENT EPOCH ONLY)")
+    print("=" * 70)
+    print(f"Warmup epochs: {args.warmup - 1}, Measurement epoch: 1")
+    print(f"Measurement epoch time: {measurement_epoch_time:.4f} seconds")
+    print(f"Total batches measured: {len(all_timing_data)}")
+    print("-" * 70)
+    
+    for key, stats in timing_stats.items():
+        print(f"\n{key.upper()}:")
+        print(f"  Average: {stats['avg']:.4f} ms")
+        print(f"  Min:     {stats['min']:.4f} ms")
+        print(f"  Max:     {stats['max']:.4f} ms")
+        print(f"  Total:   {stats['total']:.4f} ms")
+        print(f"  Count:   {stats['count']} batches")
+    
+    print(f"\nOVERALL SUMMARY:")
+    print(f"  Total epochs run: {len(epoch_times)}")
+    print(f"  Warmup epochs: {args.warmup - 1}")
+    print(f"  Measurement epochs: 1")
+    print(f"  Total execution time: {sum(epoch_times):.4f} seconds")
+    if all_timing_data:
+        avg_batch_time = sum(stats['avg'] for stats in timing_stats.values() if 'total_time' in stats) / len([s for s in timing_stats.keys() if 'total_time' in s]) if any('total_time' in k for k in timing_stats.keys()) else 0
+        print(f"  Average batch processing time: {timing_stats.get('total_time', {}).get('avg', 0):.4f} ms")
+
+    # Write comprehensive log
+    with open(f"{args.output_dir}/log.txt", "w") as f:
+        f.write("=" * 70 + "\n")
+        f.write("PERFORMANCE STATISTICS (MEASUREMENT EPOCH ONLY)\n")
+        f.write("=" * 70 + "\n\n")
+        
+        f.write("WARMUP CONFIGURATION:\n")
+        f.write(f"  Total epochs run: {len(epoch_times)}\n")
+        f.write(f"  Warmup epochs: {args.warmup - 1}\n")
+        f.write(f"  Measurement epochs: 1\n")
+        f.write(f"  Measurement epoch time: {measurement_epoch_time:.4f} seconds\n")
+        f.write(f"  Total batches measured: {len(all_timing_data)}\n\n")
+        
+        f.write("DETAILED TIMING STATISTICS:\n")
+        f.write("-" * 50 + "\n")
+        for key, stats in timing_stats.items():
+            f.write(f"{key.upper()}:\n")
+            f.write(f"  Average: {stats['avg']:.4f} ms\n")
+            f.write(f"  Min:     {stats['min']:.4f} ms\n")
+            f.write(f"  Max:     {stats['max']:.4f} ms\n")
+            f.write(f"  Total:   {stats['total']:.4f} ms\n")
+            f.write(f"  Count:   {stats['count']} batches\n\n")
+        
+        
+        f.write("CONFIGURATION:\n")
+        for arg, value in vars(args).items():
+            f.write(f"  {arg}: {value}\n")
