@@ -218,3 +218,40 @@ if [ $stage -le 8 ] && [ $stop_stage -ge 8 ]; then
         done
     done
 fi
+
+if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
+    echo "stage 10: Offline CosyVoice3 TTS (LLM + CosyVoice3 Token2Wav) inference"
+
+    datasets=(wenetspeech4tts) # wenetspeech4tts
+    backend=trtllm # hf, trtllm, vllm, trtllm-serve
+
+    batch_sizes=(1)
+    token2wav_batch_size=1
+
+    for batch_size in ${batch_sizes[@]}; do
+      for dataset in ${datasets[@]}; do
+        output_dir=./cosyvoice3_${dataset}_${backend}_llm_batch_size_${batch_size}_token2wav_batch_size_${token2wav_batch_size}_offline_trt
+        CUDA_VISIBLE_DEVICES=0 \
+            python3 infer_cosyvoice3_token2wav.py \
+                --output-dir $output_dir \
+                --llm-model-name-or-path $huggingface_model_local_dir \
+                --token2wav-path $model_scope_model_local_dir \
+                --backend $backend \
+                --batch-size $batch_size --token2wav-batch-size $token2wav_batch_size \
+                --engine-dir $trt_engines_dir \
+                --enable-trt \
+                --split-name ${dataset} || exit 1
+      done
+    done
+fi
+
+
+if [ $stage -le 11 ] && [ $stop_stage -ge 11 ]; then
+    python3 infer_cosy3_mairhub.py \
+     --token2wav-path $model_scope_model_local_dir \
+     --prompt-speech-path ./prompt_audio.wav \
+     --model-path $huggingface_model_local_dir \
+     --speech_tokenizer_model_path $model_scope_model_local_dir/speech_tokenizer_v3.onnx
+
+
+fi
