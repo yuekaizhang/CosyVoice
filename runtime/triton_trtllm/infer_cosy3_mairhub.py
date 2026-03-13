@@ -46,7 +46,13 @@ def get_args():
         default='/weights/Fun-CosyVoice3-0.5B-2512/speech_tokenizer_v3.onnx',
         help="path to speech_tokenizer_v3.onnx",
     )
-    
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help="Enable streaming audio decode (process tokens in chunks)",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -66,7 +72,7 @@ def audio_decode_cosyvoice(audio_tokens, tts_text, prompt_text, prompt_speech_pa
         prompt_feat_len=model_inputs_dict["prompt_speech_feat_len"].to(codec_decoder.model.device),
         embedding=model_inputs_dict["flow_embedding"].to(codec_decoder.model.device),
         finalize=True,
-        streaming=True,
+        streaming=False,
     )
 
     # 这里v2与v3不一样了
@@ -76,6 +82,90 @@ def audio_decode_cosyvoice(audio_tokens, tts_text, prompt_text, prompt_speech_pa
     )
 
     return audio_hat
+
+
+def audio_decode_cosyvoice_stream(audio_tokens, tts_text, prompt_text, prompt_speech_path, codec_decoder,
+                                   token_hop_len=25, stream_scale_factor=2, token_max_hop_len=100):
+    """Streaming audio decode: processes tokens in chunks matching CosyVoice3Model.tts(stream=True) pattern."""
+    device = codec_decoder.model.device
+
+    # Call frontend once to get prompt features
+    model_inputs_dict = codec_decoder.frontend.frontend_zero_shot(
+        tts_text, prompt_text, prompt_speech_path, 24000, ''
+    )
+    flow_prompt_speech_token = model_inputs_dict["flow_prompt_speech_token"].to(device)
+    flow_prompt_speech_token_len = model_inputs_dict["flow_prompt_speech_token_len"].to(device)
+    prompt_speech_feat = model_inputs_dict["prompt_speech_feat"].to(device)
+    prompt_speech_feat_len = model_inputs_dict["prompt_speech_feat_len"].to(device)
+    flow_embedding = model_inputs_dict["flow_embedding"].to(device)
+
+    # Streaming params from flow module
+    pre_lookahead_len = codec_decoder.model.flow.pre_lookahead_len
+    token_mel_ratio = codec_decoder.model.flow.token_mel_ratio
+
+    # Align first chunk with hop_len boundary (ref: model.py:345)
+    prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / token_hop_len) * token_hop_len - flow_prompt_speech_token.shape[1])
+
+    total_tokens = audio_tokens.shape[1]
+    token_offset = 0
+    current_hop = token_hop_len
+    hift_cache_mel = None
+    speech_offset = 0
+    audio_chunks = []
+
+    while token_offset < total_tokens:
+        # First chunk includes prompt_token_pad extra tokens
+        this_hop = current_hop + prompt_token_pad if token_offset == 0 else current_hop
+        remaining = total_tokens - token_offset
+
+        if remaining >= this_hop + pre_lookahead_len:
+            # Non-final chunk: include lookahead tokens
+            end_idx = token_offset + this_hop + pre_lookahead_len
+            this_token = audio_tokens[:, :end_idx].to(device, dtype=torch.int32)
+            finalize = False
+        else:
+            # Final chunk: use all remaining tokens
+            this_token = audio_tokens.to(device, dtype=torch.int32)
+            finalize = True
+
+        tts_mel, _ = codec_decoder.model.flow.inference(
+            token=this_token,
+            token_len=torch.tensor([this_token.shape[1]], dtype=torch.int32).to(device),
+            prompt_token=flow_prompt_speech_token,
+            prompt_token_len=flow_prompt_speech_token_len,
+            prompt_feat=prompt_speech_feat,
+            prompt_feat_len=prompt_speech_feat_len,
+            embedding=flow_embedding,
+            streaming=True,
+            finalize=finalize,
+        )
+
+        # Slice mel from token_offset position
+        tts_mel = tts_mel[:, :, token_offset * token_mel_ratio:]
+
+        # Accumulate mel cache
+        if hift_cache_mel is not None:
+            tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
+        hift_cache_mel = tts_mel
+
+        # HiFT inference
+        tts_speech, _ = codec_decoder.model.hift.inference(speech_feat=tts_mel, finalize=finalize)
+        tts_speech = tts_speech[:, speech_offset:]
+        speech_offset += tts_speech.shape[1]
+
+        print(f"[stream] token_offset={token_offset}, this_hop={this_hop}, "
+              f"mel_shape={tts_mel.shape}, speech_len={tts_speech.shape[1]}, finalize={finalize}")
+
+        audio_chunks.append(tts_speech.cpu())
+
+        # Advance token_offset
+        token_offset += this_hop
+        if not finalize:
+            current_hop = min(token_max_hop_len, current_hop * stream_scale_factor)
+        else:
+            break
+
+    return torch.cat(audio_chunks, dim=1)
 
 
 def extract_speech_ids(speech_tokens_str):
@@ -126,7 +216,7 @@ if __name__ == '__main__':
     with torch.no_grad():
         # # Tokenize the text
         chat = [
-            {"role": "user", "content": f"{args.prompt_text + args.input_text}"},
+            {"role": "user", "content": f"{'You are a helpful assistant.<|endofprompt|>'+ args.prompt_text + args.input_text}"},
             {"role": "assistant", "content": prompt_speech_str}
         ]
         assert 'system' not in tokenizer.chat_template, "system should not be in chat_template"
@@ -159,13 +249,22 @@ if __name__ == '__main__':
 
         speech_tokens = (torch.tensor(speech_tokens)).cuda().unsqueeze(0)
 
-        audio_hat = audio_decode_cosyvoice(
-            speech_tokens,
-            args.input_text,
-            args.prompt_text,
-            args.prompt_speech_path,
-            token2wav_model,
-        )
+        if args.streaming:
+            audio_hat = audio_decode_cosyvoice_stream(
+                speech_tokens,
+                args.input_text,
+                args.prompt_text,
+                args.prompt_speech_path,
+                token2wav_model,
+            )
+        else:
+            audio_hat = audio_decode_cosyvoice(
+                speech_tokens,
+                args.input_text,
+                args.prompt_text,
+                args.prompt_speech_path,
+                token2wav_model,
+            )
 
         audio = audio_hat.squeeze(0).cpu().numpy()
-        sf.write("gen_streaming.wav", audio, 24000)
+        sf.write("gen_streaming_new.wav", audio, 24000)

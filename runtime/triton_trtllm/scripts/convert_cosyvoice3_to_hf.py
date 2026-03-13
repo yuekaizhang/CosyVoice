@@ -318,6 +318,9 @@ def convert_cosyvoice3_to_hf(
     os.makedirs(output_dir, exist_ok=True)
     
     qwen_model.save_pretrained(output_dir)
+    
+    TEMPLATE = "{%- for message in messages %}{%- if message['role'] == 'user' %}{{- '<|sos|>' + message['content'] + '<|task_id|>' }}{%- elif message['role'] == 'assistant' %}{{- message['content']}}{%- endif %}{%- endfor %}"
+    tokenizer.chat_template = TEMPLATE
     tokenizer.save_pretrained(output_dir)
     
     # Сохраняем метаданные для TRT-LLM inference
