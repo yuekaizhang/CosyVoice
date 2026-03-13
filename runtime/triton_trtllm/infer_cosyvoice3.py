@@ -9,11 +9,6 @@
             --engine-dir $trt_engines_dir \
             --split-name ${dataset} || exit 1
 """
-
-import sys
-sys.path.insert(0, '/workspace_yuekai/tts/CosyVoice')
-sys.path.insert(0, '/workspace_yuekai/tts/CosyVoice/third_party/Matcha-TTS')
-
 import argparse
 import json
 import os
@@ -159,6 +154,9 @@ def get_args():
         "--openai-model-name", type=str, default="trt_engines_bfloat16",
         help="Model name to use with OpenAI API (for trtllm-serve backend)",
     )
+    parser.add_argument(
+        "--epoch", type=int, default=1, help="Epoch to run",
+    )
     return parser.parse_args()
 
 
@@ -282,7 +280,7 @@ def main(args):
         collate_fn=partial(data_collator, tokenizer=tokenizer, s3_tokenizer=s3_tokenizer),
     )
 
-    for epoch in range(3):
+    for epoch in range(args.epoch):
         print(f"Running epoch {epoch}")
         total_llm_time = 0
         total_token2wav_time = 0

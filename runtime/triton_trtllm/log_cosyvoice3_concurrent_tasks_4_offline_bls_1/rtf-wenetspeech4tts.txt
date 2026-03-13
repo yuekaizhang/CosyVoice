@@ -1,0 +1,11 @@
+Mode: offline
+RTF: 0.1298
+total_duration: 170.720 seconds
+(0.05 hours)
+processing time: 22.159 seconds (0.01 hours)
+latency_variance: 1127.86
+latency_50_percentile_ms: 2818.55
+latency_90_percentile_ms: 4546.05
+latency_95_percentile_ms: 5313.82
+latency_99_percentile_ms: 6115.58
+average_latency_ms: 3201.65

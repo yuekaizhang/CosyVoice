@@ -33,7 +33,7 @@ import os
 import numpy as np
 import s3tokenizer
 torch.set_num_threads(1)
-ORIGINAL_VOCAB_SIZE = 151663
+# ORIGINAL_VOCAB_SIZE = 151924
 
 
 class TritonPythonModel:
@@ -83,7 +83,7 @@ class TritonPythonModel:
 
         mels, mels_lens = s3tokenizer.padding(mels)
         codes, codes_lens = self.audio_tokenizer.quantize(mels.to(self.device), mels_lens.to(self.device))
-        codes = codes.clone() + ORIGINAL_VOCAB_SIZE
+        # codes = codes.clone() + ORIGINAL_VOCAB_SIZE
 
         responses = []
         for i in range(len(requests)):

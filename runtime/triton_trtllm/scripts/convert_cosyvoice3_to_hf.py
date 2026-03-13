@@ -190,7 +190,6 @@ def convert_cosyvoice3_to_hf(
     # Add speech tokens: <|s_0|>, <|s_1|>, ..., <|s_{embedding_size-1}|>
     # IMPORTANT: This range must match speech_embedding.num_embeddings (includes speech special tokens).
     actual_speech_tokens = speech_token_size  # Full embedding size (with speech special tokens)
-    speech_tokens = [f"<|s_{i}|>" for i in range(actual_speech_tokens)]
 
     # replace <s_6561> to <|sos|>
     # replace <s_6562> to <|eos1|>

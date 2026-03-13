@@ -13,7 +13,7 @@ import torchaudio
 from functools import partial
 from matcha.utils.audio import mel_spectrogram as matcha_mel_spectrogram
 
-ORIGINAL_VOCAB_SIZE = 151663
+
 torch.set_num_threads(1)
 
 # CosyVoice3 mel params: fmax=None (Nyquist), center=False
@@ -120,8 +120,8 @@ class TritonPythonModel:
                                 if not match:
                                     break
                                 token_num = int(match.group(1))
-                                final_id = token_num + ORIGINAL_VOCAB_SIZE
-                                yield final_id
+                                # final_id = token_num + ORIGINAL_VOCAB_SIZE
+                                yield token_num
                                 buffer = buffer[match.end():]
                     except json.JSONDecodeError:
                         continue
@@ -132,8 +132,8 @@ class TritonPythonModel:
             if not match:
                 break
             token_num = int(match.group(1))
-            final_id = token_num + ORIGINAL_VOCAB_SIZE
-            yield final_id
+            #final_id = token_num + ORIGINAL_VOCAB_SIZE
+            yield token_num
             buffer = buffer[match.end():]
 
     async def forward_llm_offline(self, target_text, reference_text, prompt_speech_tokens):
@@ -162,7 +162,8 @@ class TritonPythonModel:
         response_json = response.json()
         generated_content = response_json['choices'][0]['message']['content']
         speech_ids = parse_speech_token_string(generated_content)
-        return [sid + ORIGINAL_VOCAB_SIZE for sid in speech_ids]
+        # return [sid + ORIGINAL_VOCAB_SIZE for sid in speech_ids]
+        return speech_ids
 
     def forward_audio_tokenizer(self, wav, wav_len):
         """BLS call to audio_tokenizer."""
@@ -257,6 +258,8 @@ class TritonPythonModel:
 
         reference_text = pb_utils.get_input_tensor_by_name(request, "reference_text")
         reference_text = reference_text.as_numpy()[0][0].decode('utf-8') if reference_text is not None else ""
+        if '<|endofprompt|>' not in reference_text:
+            reference_text = 'You are a helpful assistant.<|endofprompt|>' + reference_text
 
         # Check speaker cache
         if reference_text in self.speaker_cache:

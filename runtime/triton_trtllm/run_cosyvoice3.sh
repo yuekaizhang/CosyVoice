@@ -19,7 +19,7 @@ trt_engines_dir=./trt_engines_${trt_dtype}
 
 model_repo_src=./model_repo_cosyvoice3
 model_repo=./deploy_cosyvoice3
-bls_instance_num=10
+bls_instance_num=1
 
 if [ $stage -le -1 ] && [ $stop_stage -ge -1 ]; then
 
@@ -82,7 +82,7 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
     LLM_TOKENIZER_DIR=$huggingface_model_local_dir
     BLS_INSTANCE_NUM=$bls_instance_num
     TRITON_MAX_BATCH_SIZE=1
-    DECOUPLED_MODE=True
+    DECOUPLED_MODE=False
 
     python3 scripts/fill_template.py -i ${model_repo}/cosyvoice3/config.pbtxt model_dir:${MODEL_DIR},bls_instance_num:${BLS_INSTANCE_NUM},llm_tokenizer_dir:${LLM_TOKENIZER_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
     python3 scripts/fill_template.py -i ${model_repo}/token2wav/config.pbtxt model_dir:${MODEL_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
@@ -91,6 +91,18 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
     python3 scripts/fill_template.py -i ${model_repo}/speaker_embedding/config.pbtxt model_dir:${MODEL_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
 
 fi
+
+if [ $stage -le 30 ] && [ $stop_stage -ge 30 ]; then
+    echo "Starting CosyVoice3 Triton server and LLM using trtllm-serve"
+    CUDA_VISIBLE_DEVICES=0 mpirun -np 1 --allow-run-as-root --oversubscribe trtllm-serve serve --tokenizer $huggingface_model_local_dir $trt_engines_dir --max_batch_size 64  --kv_cache_free_gpu_memory_fraction 0.4
+fi
+
+
+if [ $stage -le 40 ] && [ $stop_stage -ge 40 ]; then
+
+   CUDA_VISIBLE_DEVICES=1 tritonserver --model-repository $model_repo --http-port 18000 --grpc-port 18001 --metrics-port 18002 &
+fi
+
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
    echo "Starting CosyVoice3 Triton server and LLM using trtllm-serve"
@@ -117,7 +129,7 @@ fi
 if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
     echo "Running benchmark client for CosyVoice3"
     num_task=4
-    mode=streaming
+    mode=offline
     BLS_INSTANCE_NUM=$bls_instance_num
 
     python3 client_grpc.py \
@@ -156,14 +168,7 @@ if [ $stage -le 5 ] && [ $stop_stage -ge 5 ]; then
   done
 fi
 
-if [ $stage -le 6 ] && [ $stop_stage -ge 6 ]; then
-   echo "Running Step-Audio2-mini DiT Token2Wav inference using a single python script"
-   export CUDA_VISIBLE_DEVICES=1
-   # Note: Using pre-computed cosyvoice2 tokens
-   python3 streaming_inference.py --enable-trt --strategy equal # equal, exponential
-   # Offline Token2wav inference
-   python3 token2wav_dit.py --enable-trt
-fi
+
 
 
 if [ $stage -le 7 ] && [ $stop_stage -ge 7 ]; then
@@ -219,38 +224,28 @@ if [ $stage -le 8 ] && [ $stop_stage -ge 8 ]; then
 fi
 
 if [ $stage -le 10 ] && [ $stop_stage -ge 10 ]; then
-    echo "stage 10: Offline CosyVoice3 TTS (LLM + CosyVoice3 Token2Wav) inference"
+    echo "stage 10: Python script CosyVoice3 TTS (LLM + CosyVoice3 Token2Wav) inference"
 
     datasets=(wenetspeech4tts) # wenetspeech4tts
-    backend=trtllm # hf, trtllm, vllm, trtllm-serve
+    backend=trtllm-serve  # hf, trtllm, vllm, trtllm-serve
 
     batch_sizes=(1)
     token2wav_batch_size=1
 
     for batch_size in ${batch_sizes[@]}; do
       for dataset in ${datasets[@]}; do
-        output_dir=./cosyvoice3_${dataset}_${backend}_llm_batch_size_${batch_size}_token2wav_batch_size_${token2wav_batch_size}_offline_trt
+        output_dir=./cosyvoice3_${dataset}_${backend}_llm_batch_size_${batch_size}_token2wav_batch_size_${token2wav_batch_size}_streaming_trt
         CUDA_VISIBLE_DEVICES=0 \
-            python3 infer_cosyvoice3_token2wav.py \
+            python3 infer_cosyvoice3.py \
                 --output-dir $output_dir \
                 --llm-model-name-or-path $huggingface_model_local_dir \
                 --token2wav-path $model_scope_model_local_dir \
                 --backend $backend \
                 --batch-size $batch_size --token2wav-batch-size $token2wav_batch_size \
                 --engine-dir $trt_engines_dir \
-                --enable-trt \
+                --enable-trt --streaming\
+                --epoch 1 \
                 --split-name ${dataset} || exit 1
       done
     done
-fi
-
-
-if [ $stage -le 11 ] && [ $stop_stage -ge 11 ]; then
-    python3 infer_cosy3_mairhub.py \
-     --token2wav-path $model_scope_model_local_dir \
-     --prompt-speech-path ./prompt_audio.wav \
-     --model-path $huggingface_model_local_dir \
-     --speech_tokenizer_model_path $model_scope_model_local_dir/speech_tokenizer_v3.onnx
-
-
 fi
