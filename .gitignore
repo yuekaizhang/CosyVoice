@@ -59,3 +59,4 @@ runtime/triton_trtllm/hf_cosyvoice3_llm/
 runtime/triton_trtllm/trt_engines_bfloat16/
 runtime/triton_trtllm/trt_weights_bfloat16/
 runtime/triton_trtllm/deploy_cosyvoice3/
+.humanize*
