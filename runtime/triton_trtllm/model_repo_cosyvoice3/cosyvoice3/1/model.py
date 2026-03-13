@@ -62,9 +62,9 @@ class TritonPythonModel:
         self.logger.log_info(f"CosyVoice3 BLS initialized, decoupled={self.decoupled}, "
                              f"chunk_strategy={self.dynamic_chunk_strategy}")
 
-        # HTTP client for remote LLM
+        # HTTP client for remote LLM (trtllm-serve default port: 8000)
         self.http_client = httpx.AsyncClient()
-        self.api_base = "http://localhost:8000/v1/chat/completions"
+        self.api_base = model_params.get("llm_api_base", "http://localhost:8000/v1/chat/completions")
 
         # Speaker cache to avoid redundant audio_tokenizer/speaker_embedding calls
         self.speaker_cache = {}
