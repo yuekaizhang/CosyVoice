@@ -46,7 +46,7 @@ class TritonPythonModel:
 
     def execute(self, requests):
         responses = []
-        for request in requests:
+        for req_idx, request in enumerate(requests):
             mel = pb_utils.get_input_tensor_by_name(request, "mel")
             mel = torch.utils.dlpack.from_dlpack(mel.to_dlpack()).to(self.device)
             if mel.dim() == 2:

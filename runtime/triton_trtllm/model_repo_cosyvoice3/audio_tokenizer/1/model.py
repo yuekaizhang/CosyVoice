@@ -58,18 +58,11 @@ class TritonPythonModel:
         self.audio_tokenizer = s3tokenizer.load_model(model_path).to(self.device)
 
     def execute(self, requests):
-        """Execute inference on the batched requests.
-
-        Args:
-            requests: List of inference requests
-
-        Returns:
-            List of inference responses containing tokenized outputs
-        """
+        """Execute inference on the batched requests."""
         mels = []
 
         # Process each request in batch
-        for request in requests:
+        for req_idx, request in enumerate(requests):
             # Extract input tensors
             wav_array = pb_utils.get_input_tensor_by_name(
                 request, "reference_wav").as_numpy()
@@ -79,11 +72,11 @@ class TritonPythonModel:
             wav_array = torch.from_numpy(wav_array).to(self.device)
             # Prepare inputs
             wav = wav_array[:, :wav_len].squeeze(0)
-            mels.append(s3tokenizer.log_mel_spectrogram(wav))
+            mel = s3tokenizer.log_mel_spectrogram(wav)
+            mels.append(mel)
 
         mels, mels_lens = s3tokenizer.padding(mels)
         codes, codes_lens = self.audio_tokenizer.quantize(mels.to(self.device), mels_lens.to(self.device))
-        # codes = codes.clone() + ORIGINAL_VOCAB_SIZE
 
         responses = []
         for i in range(len(requests)):

@@ -133,7 +133,7 @@ class TritonPythonModel:
 
     def execute(self, requests):
         responses = []
-        for request in requests:
+        for req_idx, request in enumerate(requests):
             target_speech_tokens = pb_utils.get_input_tensor_by_name(
                 request, "target_speech_tokens")
             target_speech_tokens = torch.utils.dlpack.from_dlpack(
@@ -192,6 +192,7 @@ class TritonPythonModel:
 
             # Output mel as [80, T] (squeeze batch dim for Triton)
             mel_out = mel.squeeze(0).float()  # [80, T]
+            mel_out = mel_out.cpu() # otherwise, dlpack bug
             mel_tensor = pb_utils.Tensor.from_dlpack("mel", to_dlpack(mel_out))
             inference_response = pb_utils.InferenceResponse(output_tensors=[mel_tensor])
             responses.append(inference_response)

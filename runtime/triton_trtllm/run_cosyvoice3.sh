@@ -36,7 +36,7 @@ if [ $stage -le 0 ] && [ $stop_stage -ge 0 ]; then
     # huggingface-cli download --local-dir $huggingface_model_local_dir yuekai/cosyvoice2_llm
     # modelscope download --model iic/CosyVoice2-0.5B --local_dir $model_scope_model_local_dir
 
-    # pip3 install x_transformers, s3tokenizer --force-reinstall
+    # pip3 install --upgrade x_transformers s3tokenizer 
     # pip install -U nvidia-modelopt[all]
     python3 scripts/convert_cosyvoice3_to_hf.py \
         --model-dir $model_scope_model_local_dir \
@@ -82,7 +82,7 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
     LLM_TOKENIZER_DIR=$huggingface_model_local_dir
     BLS_INSTANCE_NUM=$bls_instance_num
     TRITON_MAX_BATCH_SIZE=1
-    DECOUPLED_MODE=False
+    DECOUPLED_MODE=True
 
     python3 scripts/fill_template.py -i ${model_repo}/cosyvoice3/config.pbtxt model_dir:${MODEL_DIR},bls_instance_num:${BLS_INSTANCE_NUM},llm_tokenizer_dir:${LLM_TOKENIZER_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
     python3 scripts/fill_template.py -i ${model_repo}/token2wav/config.pbtxt model_dir:${MODEL_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
@@ -130,6 +130,7 @@ if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
     echo "Running benchmark client for CosyVoice3"
     num_task=4
     mode=offline
+    mode=streaming
     BLS_INSTANCE_NUM=$bls_instance_num
 
     python3 client_grpc.py \

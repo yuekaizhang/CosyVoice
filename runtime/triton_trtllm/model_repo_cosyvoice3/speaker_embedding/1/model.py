@@ -125,17 +125,10 @@ class TritonPythonModel:
         return embedding.half()
 
     def execute(self, requests):
-        """Execute inference on the batched requests.
-
-        Args:
-            requests: List of inference requests
-
-        Returns:
-            List of inference responses containing tokenized outputs
-        """
+        """Execute inference on the batched requests."""
         responses = []
         # Process each request in batch
-        for request in requests:
+        for req_idx, request in enumerate(requests):
             # Extract input tensors
             wav_array = pb_utils.get_input_tensor_by_name(
                 request, "reference_wav").as_numpy()
