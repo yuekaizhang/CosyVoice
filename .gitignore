@@ -50,3 +50,11 @@ pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
+
+# Triton RLCR / temp files
+runtime/triton_trtllm/plan.md
+runtime/triton_trtllm/plan.new.md
+runtime/triton_trtllm/tmp/
+runtime/triton_trtllm/hf_cosyvoice3_llm/
+runtime/triton_trtllm/trt_engines_bfloat16/
+runtime/triton_trtllm/trt_weights_bfloat16/
