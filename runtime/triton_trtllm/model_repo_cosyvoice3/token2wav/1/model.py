@@ -69,7 +69,6 @@ def convert_onnx_to_trt(trt_model, trt_kwargs, onnx_model, fp16, autocast_mode=F
         f.write(engine_bytes)
     logging.info("Successfully converted onnx to trt")
 
-ORIGINAL_VOCAB_SIZE = 151663
 torch.set_num_threads(1)
 
 
@@ -142,9 +141,6 @@ class TritonPythonModel:
             if target_speech_tokens.dim() == 1:
                 target_speech_tokens = target_speech_tokens.unsqueeze(0)
 
-            # Shift tokens by ORIGINAL_VOCAB_SIZE
-            target_speech_tokens = target_speech_tokens - ORIGINAL_VOCAB_SIZE
-
             # Optional inputs
             prompt_speech_tokens_pb = pb_utils.get_input_tensor_by_name(
                 request, "prompt_speech_tokens")
@@ -153,7 +149,6 @@ class TritonPythonModel:
                     prompt_speech_tokens_pb.to_dlpack()).to(self.device)
                 if prompt_speech_tokens.dim() == 1:
                     prompt_speech_tokens = prompt_speech_tokens.unsqueeze(0)
-                prompt_speech_tokens = prompt_speech_tokens - ORIGINAL_VOCAB_SIZE
 
                 prompt_speech_feat = pb_utils.get_input_tensor_by_name(
                     request, "prompt_speech_feat")
