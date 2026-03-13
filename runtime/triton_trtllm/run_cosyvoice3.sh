@@ -17,7 +17,8 @@ trt_dtype=bfloat16
 trt_weights_dir=./trt_weights_${trt_dtype}
 trt_engines_dir=./trt_engines_${trt_dtype}
 
-model_repo=./model_repo_cosyvoice3
+model_repo_src=./model_repo_cosyvoice3
+model_repo=./deploy_cosyvoice3
 bls_instance_num=10
 
 if [ $stage -le -1 ] && [ $stop_stage -ge -1 ]; then
@@ -65,37 +66,35 @@ if [ $stage -le 1 ] && [ $stop_stage -ge 1 ]; then
 fi
 
 if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
-    echo "Creating model repository async mode"
+    echo "Creating CosyVoice3 model repository"
     rm -rf $model_repo
     mkdir -p $model_repo
-    cosyvoice2_dir="cosyvoice2_dit"
-    token2wav_dir="token2wav_dit"
 
-    cp -r ./model_repo/${cosyvoice2_dir} $model_repo
-    cp -r ./model_repo/${token2wav_dir} $model_repo
-    cp -r ./model_repo/audio_tokenizer $model_repo
-    cp -r ./model_repo/speaker_embedding $model_repo
+    # Copy all modules from template source
+    cp -r ${model_repo_src}/cosyvoice3 $model_repo/
+    cp -r ${model_repo_src}/token2wav $model_repo/
+    cp -r ${model_repo_src}/vocoder $model_repo/
+    cp -r ${model_repo_src}/audio_tokenizer $model_repo/
+    cp -r ${model_repo_src}/speaker_embedding $model_repo/
 
-
-    ENGINE_PATH=$trt_engines_dir
     MAX_QUEUE_DELAY_MICROSECONDS=0
     MODEL_DIR=$model_scope_model_local_dir
     LLM_TOKENIZER_DIR=$huggingface_model_local_dir
     BLS_INSTANCE_NUM=$bls_instance_num
     TRITON_MAX_BATCH_SIZE=1
-    DECOUPLED_MODE=True # Only streaming TTS mode is supported using Nvidia Triton for now
-    STEP_AUDIO_MODEL_DIR=$step_audio_model_dir/token2wav
+    DECOUPLED_MODE=True
 
-    python3 scripts/fill_template.py -i ${model_repo}/${token2wav_dir}/config.pbtxt model_dir:${STEP_AUDIO_MODEL_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
-    python3 scripts/fill_template.py -i ${model_repo}/${cosyvoice2_dir}/config.pbtxt model_dir:${MODEL_DIR},bls_instance_num:${BLS_INSTANCE_NUM},llm_tokenizer_dir:${LLM_TOKENIZER_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
+    python3 scripts/fill_template.py -i ${model_repo}/cosyvoice3/config.pbtxt model_dir:${MODEL_DIR},bls_instance_num:${BLS_INSTANCE_NUM},llm_tokenizer_dir:${LLM_TOKENIZER_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
+    python3 scripts/fill_template.py -i ${model_repo}/token2wav/config.pbtxt model_dir:${MODEL_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
+    python3 scripts/fill_template.py -i ${model_repo}/vocoder/config.pbtxt model_dir:${MODEL_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
     python3 scripts/fill_template.py -i ${model_repo}/audio_tokenizer/config.pbtxt model_dir:${MODEL_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
     python3 scripts/fill_template.py -i ${model_repo}/speaker_embedding/config.pbtxt model_dir:${MODEL_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
 
 fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
-   echo "Starting Token2wav Triton server and Cosyvoice2 llm using trtllm-serve"
-   mpirun -np 1 --allow-run-as-root --oversubscribe trtllm-serve serve --tokenizer $huggingface_model_local_dir $trt_engines_dir --max_batch_size 64  --kv_cache_free_gpu_memory_fraction 0.4 &
+   echo "Starting CosyVoice3 Triton server and LLM using trtllm-serve"
+   CUDA_VISIBLE_DEVICES=0 mpirun -np 1 --allow-run-as-root --oversubscribe trtllm-serve serve --tokenizer $huggingface_model_local_dir $trt_engines_dir --max_batch_size 64  --kv_cache_free_gpu_memory_fraction 0.4 &
    tritonserver --model-repository $model_repo --http-port 18000 &
    wait
     # Test using curl
@@ -116,19 +115,19 @@ if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
 fi
 
 if [ $stage -le 4 ] && [ $stop_stage -ge 4 ]; then
-    echo "Running benchmark client"
+    echo "Running benchmark client for CosyVoice3"
     num_task=4
     mode=streaming
     BLS_INSTANCE_NUM=$bls_instance_num
 
     python3 client_grpc.py \
         --server-addr localhost \
-        --server-port 8001 \
-        --model-name cosyvoice2_dit \
+        --server-port 18001 \
+        --model-name cosyvoice3 \
         --num-tasks $num_task \
         --mode $mode \
         --huggingface-dataset yuekai/seed_tts_cosy2 \
-        --log-dir ./log_single_gpu_concurrent_tasks_${num_task}_${mode}_bls_${BLS_INSTANCE_NUM}
+        --log-dir ./log_cosyvoice3_concurrent_tasks_${num_task}_${mode}_bls_${BLS_INSTANCE_NUM}
 
 fi
 
