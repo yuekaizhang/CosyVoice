@@ -33,17 +33,13 @@ def cosyvoice3_example():
 def cosyvoice3_spec_example():
     """CosyVoice3 + DSpark speculative decoding.
 
-    Requires:
-    1. A HuggingFace-format export of the CosyVoice3 LLM (produced by
-       runtime/triton_trtllm/scripts/convert_cosyvoice3_to_hf.py).
-    2. A speculators-format DSpark drafter checkpoint (local path or HF repo).
-    3. The speculative vllm fork (yuekaizhang/vllm, branch
-       dspark-draft-sampling-mirrors) loaded via PYTHONPATH with compiled
-       extensions from a vllm-omni 0.25.1 build.
+    Setup (one-time):
+        pip install vllm-omni==0.25.1
+        git clone -b dspark-draft-sampling-mirrors https://github.com/yuekaizhang/vllm
+        export PYTHONPATH=/path/to/yuekaizhang/vllm:$PYTHONPATH
 
-    Example launch (set PYTHONPATH before starting Python):
-        PYTHONPATH=/path/to/speculative/vllm:/path/to/vllm025_venv/lib/python3.12/site-packages \\
-            python vllm_example.py
+    Then run:
+        python vllm_example.py
     """
     DRAFT_MODEL = 'yuekai/cosyvoice3_llm_dspark'  # or local path to checkpoint_best/
 
@@ -62,8 +58,8 @@ def cosyvoice3_spec_example():
 
 def main():
     # cosyvoice2_example()
-    # cosyvoice3_example()
-    cosyvoice3_spec_example()
+    cosyvoice3_example()
+    # cosyvoice3_spec_example()
 
 
 if __name__ == '__main__':
