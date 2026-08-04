@@ -41,6 +41,8 @@ def get_args():
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--cuda-graph-buckets", type=str, default=None,
                         help="comma-separated audio seconds; bucketed graphs instead of per-shape")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="samples per batch (flashinfer backend only; packed varlen)")
     return parser.parse_args()
 
 
@@ -110,14 +112,25 @@ def main():
                 f.write(f"{utt}\t{target_text}\n")
 
     # ---------------- benchmark ----------------
+    if args.batch_size > 1:
+        assert args.backend == "flashinfer", "batch>1 requires the flashinfer packed path"
+        from token2wav_cosyvoice3_flashinfer import token2wav_forward_batched
+
     for epoch in range(args.epochs):
         stats["seconds"], stats["calls"] = 0.0, 0
         torch.manual_seed(0)
         start = time.time()
         wavs_out = []
-        for i in range(len(metas)):
-            wavs = model([target_tokens[i]], [prompt_wavs[i]], [16000])
-            wavs_out.append(wavs[0])
+        if args.batch_size > 1:
+            for i in range(0, len(metas), args.batch_size):
+                j = min(i + args.batch_size, len(metas))
+                wavs = token2wav_forward_batched(
+                    model, target_tokens[i:j], prompt_wavs[i:j], [16000] * (j - i))
+                wavs_out.extend(wavs)
+        else:
+            for i in range(len(metas)):
+                wavs = model([target_tokens[i]], [prompt_wavs[i]], [16000])
+                wavs_out.append(wavs[0])
         torch.cuda.synchronize()
         e2e = time.time() - start
         audio_s = sum(w.shape[-1] for w in wavs_out) / 24000
@@ -131,7 +144,8 @@ def main():
                             wav.cpu().float(), 24000)
 
     tag = args.backend + ("+cudagraph" if args.cuda_graph else "") + \
-        (f"+buckets[{args.cuda_graph_buckets}]" if args.cuda_graph_buckets else "")
+        (f"+buckets[{args.cuda_graph_buckets}]" if args.cuda_graph_buckets else "") + \
+        f"+b{args.batch_size}"
     print(f"RESULT backend={tag} e2e={e2e:.3f}s estimator={stats['seconds']:.3f}s "
           f"ms_per_call={stats['seconds'] / max(stats['calls'], 1) * 1000:.2f}")
 

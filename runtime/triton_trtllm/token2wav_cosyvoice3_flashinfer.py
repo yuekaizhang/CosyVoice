@@ -114,6 +114,69 @@ try:
         tl.store(NORM_OUT + row * D + cols,
                  (hc * rstd * sc + sh).to(NORM_OUT.dtype.element_ty))
 
+    @triton.jit
+    def _ln_modulate_packed_kernel(X, SHIFT, SCALE, OUT, DOC, mod_stride,
+                                   eps: tl.constexpr, D: tl.constexpr):
+        """Packed-layout variant: per-row document id instead of row//n."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, D)
+        x = tl.load(X + row * D + cols).to(tl.float32)
+        mean = tl.sum(x) / D
+        xc = x - mean
+        rstd = 1.0 / tl.sqrt(tl.sum(xc * xc) / D + eps)
+        b = tl.load(DOC + row)
+        sh = tl.load(SHIFT + b * mod_stride + cols).to(tl.float32)
+        sc = tl.load(SCALE + b * mod_stride + cols).to(tl.float32)
+        tl.store(OUT + row * D + cols,
+                 (xc * rstd * sc + sh).to(OUT.dtype.element_ty))
+
+    @triton.jit
+    def _gate_ln_modulate_packed_kernel(H, GATE, Y, SHIFT, SCALE, H_OUT,
+                                        NORM_OUT, DOC, mod_stride,
+                                        eps: tl.constexpr, D: tl.constexpr):
+        row = tl.program_id(0)
+        cols = tl.arange(0, D)
+        b = tl.load(DOC + row)
+        h = tl.load(H + row * D + cols).to(tl.float32)
+        g = tl.load(GATE + b * mod_stride + cols).to(tl.float32)
+        y = tl.load(Y + row * D + cols).to(tl.float32)
+        h = h + g * y
+        tl.store(H_OUT + row * D + cols, h.to(H_OUT.dtype.element_ty))
+        mean = tl.sum(h) / D
+        hc = h - mean
+        rstd = 1.0 / tl.sqrt(tl.sum(hc * hc) / D + eps)
+        sh = tl.load(SHIFT + b * mod_stride + cols).to(tl.float32)
+        sc = tl.load(SCALE + b * mod_stride + cols).to(tl.float32)
+        tl.store(NORM_OUT + row * D + cols,
+                 (hc * rstd * sc + sh).to(NORM_OUT.dtype.element_ty))
+
+    @triton.jit
+    def _qkv_rope_repack_packed_kernel(QKV, Q, K, V, COS, SIN, POS,
+                                       D: tl.constexpr):
+        """Packed variant: per-row rope position from POS (restarts per doc)."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, D)
+        base = row * 3 * D
+        q = tl.load(QKV + base + cols).to(tl.float32)
+        k = tl.load(QKV + base + D + cols).to(tl.float32)
+        v = tl.load(QKV + base + 2 * D + cols)
+
+        is_h0 = cols < 64
+        pos = tl.load(POS + row)
+        pair = cols // 2
+        cos = tl.load(COS + pos * 32 + pair, mask=is_h0, other=1.0)
+        sin = tl.load(SIN + pos * 32 + pair, mask=is_h0, other=0.0)
+        partner = tl.where(cols % 2 == 0, cols + 1, cols - 1)
+        sign = tl.where(cols % 2 == 0, -1.0, 1.0)
+        qp = tl.load(QKV + base + partner, mask=is_h0, other=0.0).to(tl.float32)
+        kp = tl.load(QKV + base + D + partner, mask=is_h0, other=0.0).to(tl.float32)
+        q = tl.where(is_h0, q * cos + sign * qp * sin, q)
+        k = tl.where(is_h0, k * cos + sign * kp * sin, k)
+
+        tl.store(Q + row * D + cols, q.to(Q.dtype.element_ty))
+        tl.store(K + row * D + cols, k.to(K.dtype.element_ty))
+        tl.store(V + row * D + cols, v)
+
     _HAS_TRITON = True
 except Exception:  # pragma: no cover
     _HAS_TRITON = False
@@ -170,6 +233,21 @@ class RaggedAttentionRunner:
         )
         self._planned_key = key
 
+    def plan_docs(self, doc_lens: List[int], dtype: torch.dtype):
+        """Plan for variable-length packed documents."""
+        key = (tuple(doc_lens), dtype)
+        if key == self._planned_key:
+            return
+        indptr = torch.zeros(len(doc_lens) + 1, dtype=torch.int32, device=self.device)
+        indptr[1:] = torch.cumsum(
+            torch.tensor(doc_lens, dtype=torch.int32, device=self.device), dim=0)
+        self.wrapper.plan(
+            indptr, indptr, self.num_heads, self.num_heads, self.head_dim,
+            causal=False, sm_scale=self.head_dim ** -0.5,
+            q_data_type=dtype, kv_data_type=dtype,
+        )
+        self._planned_key = key
+
 
 def _rotate_half_interleaved(x):
     # x_transformers rotate_half: interleaved pairs (GPT-NeoX style)
@@ -209,6 +287,7 @@ class FlashInferDiT(nn.Module):
 
         self.attn_runner = RaggedAttentionRunner(heads, dim_head, torch.device(device))
         self._graph_cache = {}
+        self._pack_cache = {}
         self._finalized = False
         # triton fusion only pays off when its launcher overhead is hidden by
         # graph replay; eager mode keeps the native-kernel path
@@ -279,6 +358,10 @@ class FlashInferDiT(nn.Module):
                 x.to(dtype), mu.to(dtype), spks.to(dtype), cond.to(dtype), t.to(dtype))
 
             b, _, seq_len = x.shape
+            if b > 2:
+                # multi-sample CFG batch (2B rows, per-row valid lengths):
+                # zero-padding packed away inside
+                return self._forward_packed(x, mask, mu, t, spks, cond)
             if self.enable_cuda_graph:
                 if self.cuda_graph_buckets is not None:
                     return self._forward_graph_bucketed(x, mu, t, spks, cond)
@@ -286,6 +369,91 @@ class FlashInferDiT(nn.Module):
 
             self.attn_runner.plan(b, seq_len, dtype)
             return self._forward_impl(x, mu, t, spks, cond, self.attn_runner, None)
+
+    def _forward_packed(self, x, mask, mu, t, spks, cond):
+        """Batch>1 path: padded (2B, 80, maxT) rows are packed into one
+        varlen sequence (total real tokens) for the transformer stack —
+        zero padding compute, exact ragged attention per document."""
+        assert _HAS_TRITON, "packed batch mode requires triton"
+        b, _, maxT = x.shape
+        n_dim = self.dim
+        lens_t = mask[:, 0].sum(-1).to(torch.int64)
+        lens = [int(v) for v in lens_t.tolist()]
+        key = (b, maxT, tuple(lens))
+        meta = self._pack_cache.get(key)
+        if meta is None:
+            device = x.device
+            pack_idx = torch.cat([
+                torch.arange(r * maxT, r * maxT + l, device=device)
+                for r, l in enumerate(lens)])
+            doc_ids = torch.repeat_interleave(
+                torch.arange(b, device=device, dtype=torch.int32), lens_t.to(device))
+            pos_ids = torch.cat([
+                torch.arange(l, device=device, dtype=torch.int32) for l in lens])
+            meta = {"pack_idx": pack_idx, "doc_ids": doc_ids, "pos_ids": pos_ids,
+                    "lens": lens}
+            self._pack_cache[key] = meta
+        self.attn_runner.plan_docs(meta["lens"], x.dtype)
+
+        # input embedding on the padded layout (cheap; causal conv is
+        # pad-safe since padding sits at the tail of each row)
+        xT, muT, condT = x.transpose(1, 2), mu.transpose(1, 2), cond.transpose(1, 2)
+        spks_rep = spks.unsqueeze(1).expand(-1, maxT, -1)
+        h0 = self.input_embed.proj(torch.cat([xT, condT, muT, spks_rep], dim=-1))
+        h = self._conv_pos_forward(h0) + h0
+
+        # pack: (2B, maxT, dim) -> (total, dim)
+        hp = h.reshape(b * maxT, n_dim).index_select(0, meta["pack_idx"])
+        total = hp.shape[0]
+        doc_ids, pos_ids = meta["doc_ids"], meta["pos_ids"]
+
+        t_emb = self.time_embed(t)  # (2B, dim)
+        ada = F.linear(F.silu(t_emb), self._ada_w, self._ada_b)  # (2B, W)
+        six = 6 * n_dim
+        mods = [ada[:, i * six:(i + 1) * six].chunk(6, dim=-1)
+                for i in range(self.depth)]
+        fscale, fshift = ada[:, self.depth * six:].chunk(2, dim=-1)
+        stride = ada.stride(0)
+        eps = 1e-6
+
+        def ln_mod(hh, shift, scale):
+            out = torch.empty_like(hh)
+            _ln_modulate_packed_kernel[(total,)](
+                hh, shift, scale, out, doc_ids, stride, eps, n_dim)
+            return out
+
+        def gate_ln(hh, gate, y, shift, scale):
+            h_out = torch.empty_like(hh)
+            norm_out = torch.empty_like(hh)
+            _gate_ln_modulate_packed_kernel[(total,)](
+                hh, gate, y, shift, scale, h_out, norm_out, doc_ids, stride,
+                eps, n_dim)
+            return h_out, norm_out
+
+        norm = ln_mod(hp, mods[0][0], mods[0][1])
+        for i, block in enumerate(self.transformer_blocks):
+            _, _, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods[i]
+            attn = block.attn
+            qkv = F.linear(norm, attn._fi_w_qkv, attn._fi_b_qkv)  # (total, 3d)
+            q = torch.empty(total, self.heads, self.dim_head,
+                            dtype=qkv.dtype, device=qkv.device)
+            k = torch.empty_like(q)
+            v = torch.empty_like(q)
+            _qkv_rope_repack_packed_kernel[(total,)](
+                qkv, q, k, v, self._rope_cos32, self._rope_sin32, pos_ids, n_dim)
+            attn_out = attn.to_out[0](
+                self.attn_runner.wrapper.run(q, k, v).reshape(total, n_dim))
+            hp, ffn_in = gate_ln(hp, gate_msa, attn_out, shift_mlp, scale_mlp)
+            ff_out = block.ff(ffn_in)
+            if i + 1 < self.depth:
+                hp, norm = gate_ln(hp, gate_mlp, ff_out, mods[i + 1][0], mods[i + 1][1])
+            else:
+                _, norm = gate_ln(hp, gate_mlp, ff_out, fshift, fscale)
+
+        y = self.proj_out(norm)  # (total, 80)
+        out = torch.zeros(b * maxT, y.shape[-1], dtype=y.dtype, device=y.device)
+        out.index_copy_(0, meta["pack_idx"], y)
+        return out.view(b, maxT, -1).transpose(1, 2)
 
     def _apply_rope_head0(self, x_bnhd, cis):
         """x_transformers partial rope == rotate only head 0 in NHD layout.
@@ -481,6 +649,120 @@ class FlashInferDiT(nn.Module):
                                      static["spks"], static["cond"], runner, pad_mask)
         return {"graph": graph, "out": out, "x": static, "runner": runner,
                 "pad_mask": pad_mask}
+
+
+@torch.inference_mode()
+def _solve_euler_batched(decoder, z, mu, mask, spks, cond, n_timesteps=10):
+    """Batched CFG euler solver: the repo's solve_euler hardcodes batch=1
+    buffers, so multi-sample batches build the 2B-row CFG stack here."""
+    B = mu.shape[0]
+    t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=spks.dtype)
+    t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+    t, dt = t_span[0], t_span[1] - t_span[0]
+
+    mask_in = mask.repeat(2, 1, 1).to(spks.dtype)
+    mu_in = torch.cat([mu, torch.zeros_like(mu)], dim=0).to(spks.dtype)
+    spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0)
+    cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0).to(spks.dtype)
+    t_in = torch.zeros(2 * B, device=mu.device, dtype=spks.dtype)
+
+    x = z.to(spks.dtype)
+    for step in range(1, len(t_span)):
+        x_in = x.repeat(2, 1, 1)
+        t_in.fill_(t)
+        dphi_dt = decoder.forward_estimator(
+            x_in, mask_in, mu_in, t_in, spks_in, cond_in, False)
+        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [B, B], dim=0)
+        dphi_dt = ((1.0 + decoder.inference_cfg_rate) * dphi_dt
+                   - decoder.inference_cfg_rate * cfg_dphi_dt)
+        x = x + dt * dphi_dt
+        t = t + dt
+        if step < len(t_span) - 1:
+            dt = t_span[step + 1] - t
+    return x
+
+
+@torch.inference_mode()
+def flow_inference_batched(flow, token_list, prompt_feat_list, embedding):
+    """Batched replica of CausalMaskedDiffWithDiT.inference (offline).
+
+    Args:
+        flow: the CausalMaskedDiffWithDiT module (fp16, flashinfer estimator).
+        token_list: per-sample [prompt_tokens + generated_tokens] (list of list[int]).
+        prompt_feat_list: per-sample prompt mel (1, L_i, 80).
+        embedding: (B, 192) speaker embeddings.
+    Returns:
+        list of per-sample generated mel (1, 80, mel_len2_i), fp32.
+    """
+    device = embedding.device
+    from cosyvoice.utils.mask import make_pad_mask
+
+    embedding = embedding.to(next(flow.parameters()).dtype)
+    B = len(token_list)
+    token_lens = torch.tensor([len(tk) for tk in token_list], device=device)
+    max_tok = int(token_lens.max())
+    token = torch.zeros(B, max_tok, dtype=torch.long, device=device)
+    for i, tk in enumerate(token_list):
+        token[i, :len(tk)] = torch.tensor(tk, device=device)
+
+    embedding = F.normalize(embedding, dim=1)
+    embedding = flow.spk_embed_affine_layer(embedding)
+
+    mask = (~make_pad_mask(token_lens)).unsqueeze(-1).to(embedding)
+    token = flow.input_embedding(torch.clamp(token, min=0)) * mask
+    h = flow.pre_lookahead_layer(token)  # zero right-pad == batch pad: exact
+    h = h.repeat_interleave(flow.token_mel_ratio, dim=1)
+
+    mel_lens = token_lens * flow.token_mel_ratio
+    max_mel = int(mel_lens.max())
+    conds = torch.zeros(B, max_mel, flow.output_size, device=device, dtype=h.dtype)
+    mel_len1 = []
+    for i, pf in enumerate(prompt_feat_list):
+        l1 = pf.shape[1]
+        mel_len1.append(l1)
+        conds[i, :l1] = pf[0].to(h.dtype)
+    conds = conds.transpose(1, 2)
+
+    mel_mask = (~make_pad_mask(mel_lens, max_len=max_mel)).to(h)
+
+    z = torch.randn(B, flow.output_size, max_mel, device=device, dtype=h.dtype)
+    feat = _solve_euler_batched(
+        flow.decoder, z,
+        mu=h.transpose(1, 2).contiguous(),
+        mask=mel_mask.unsqueeze(1),
+        spks=embedding,
+        cond=conds,
+        n_timesteps=10,
+    )
+    return [feat[i:i + 1, :, mel_len1[i]:int(mel_lens[i])].float() for i in range(B)]
+
+
+@torch.inference_mode()
+def token2wav_forward_batched(model, generated_speech_tokens_list,
+                              prompt_audios_list, prompt_audios_sample_rate):
+    """Batched replica of CosyVoice3_Token2Wav.forward (offline): batched
+    flow with the packed flashinfer estimator, per-sample hift vocoder."""
+    assert all(sr == 16000 for sr in prompt_audios_sample_rate)
+    prompt_speech_tokens_list = model.prompt_audio_tokenization(prompt_audios_list)
+    prompt_mels, prompt_mels_lens = model.get_prompt_mels(
+        prompt_audios_list, prompt_audios_sample_rate)
+    spk_emb = model.get_spk_emb(prompt_audios_list).to(model.device)
+
+    token_list, prompt_feat_list = [], []
+    for i in range(len(generated_speech_tokens_list)):
+        tok_len = min(int(prompt_mels_lens[i].item() / 2),
+                      len(prompt_speech_tokens_list[i]))
+        prompt_tokens = prompt_speech_tokens_list[i][:tok_len]
+        token_list.append(prompt_tokens + generated_speech_tokens_list[i])
+        prompt_feat_list.append(prompt_mels[i:i + 1, :2 * tok_len].to(model.device))
+
+    mels = flow_inference_batched(model.flow, token_list, prompt_feat_list, spk_emb)
+
+    wavs = []
+    for mel in mels:
+        wav, _ = model.hift.inference(speech_feat=mel, finalize=True)
+        wavs.append(wav)
+    return wavs
 
 
 def apply_flashinfer(model, enable_cuda_graph=False, cuda_graph_buckets=None):
