@@ -358,14 +358,15 @@ class FlashInferDiT(nn.Module):
                 x.to(dtype), mu.to(dtype), spks.to(dtype), cond.to(dtype), t.to(dtype))
 
             b, _, seq_len = x.shape
-            if b > 2:
-                # multi-sample CFG batch (2B rows, per-row valid lengths):
-                # zero-padding packed away inside
-                return self._forward_packed(x, mask, mu, t, spks, cond)
-            if self.enable_cuda_graph:
+            if self.enable_cuda_graph and b == 2:
                 if self.cuda_graph_buckets is not None:
                     return self._forward_graph_bucketed(x, mu, t, spks, cond)
                 return self._forward_graph(x, mu, t, spks, cond)
+            if _HAS_TRITON:
+                # packed varlen path: fastest no-graph route even at b=2
+                # (single-sample CFG) — fused triton kernels amortize their
+                # launcher cost over far fewer total launches
+                return self._forward_packed(x, mask, mu, t, spks, cond)
 
             self.attn_runner.plan(b, seq_len, dtype)
             return self._forward_impl(x, mu, t, spks, cond, self.attn_runner, None)
